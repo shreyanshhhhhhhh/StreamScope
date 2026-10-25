@@ -1,0 +1,26 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: streamscope-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+
+  dashboard:
+    build: .
+    container_name: streamscope-dashboard
+    restart: unless-stopped
+    ports:
+      - "8502:8502"
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      GENRE_CSV: /data/genre_interest.csv
+    volumes:
+      - ../output:/data:ro
+    depends_on:
+      - mongo
+
+volumes:
+  mongodata:
