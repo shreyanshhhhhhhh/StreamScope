@@ -2,7 +2,7 @@
 
 Single-node Hadoop pipeline for MovieLens genre demand, with a Dockerized Streamlit app that queries TMDB watch-provider documents stored in MongoDB.
 
-Hadoop and PySpark stay on the host. The container reads the genre table PySpark already wrote to HDFS, and queries MongoDB for the unstructured provider JSON.
+Hadoop and PySpark stay on the host. When the dashboard container starts, it uploads the curated PySpark genre table into MongoDB collection `streamscope.genre_interest`, then the page queries that collection. TMDB watch-provider JSON, once fetched, is queried from `streamscope.tmdb_providers`. The 32 million ratings are not copied into MongoDB.
 
 ## Run the Docker app
 

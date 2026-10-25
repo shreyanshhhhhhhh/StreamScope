@@ -1,9 +1,7 @@
-"""Streamlit app for the Docker mark.
+"""Query MongoDB and draw the StreamScope comparisons.
 
-The genre table is the PySpark aggregate already stored on HDFS, copied out
-with `hdfs dfs -getmerge` and mounted into the container. Watch-provider JSON
-is queried from MongoDB. Hadoop stays on the host: inside a container,
-localhost:9000 is not the NameNode.
+upload_genres.py loads the PySpark genre table before this process starts.
+TMDB watch-provider documents, when present, are queried from tmdb_providers.
 """
 
 import os
@@ -14,42 +12,22 @@ import plotly.express as px
 import streamlit as st
 from pymongo import MongoClient
 
-GENRE_CSV = os.environ.get("GENRE_CSV", "/data/genre_interest.csv")
+from upload_genres import COLLECTION, DATABASE, GENRES, upload_genres
+
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
 
-GENRES = [
-    "Action", "Adventure", "Animation", "Children", "Comedy", "Crime",
-    "Documentary", "Drama", "Fantasy", "Film-Noir", "Horror", "IMAX",
-    "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western",
-]
 
-COLUMN_ALIASES = {
-    "count": "rating_count",
-    "count(rating)": "rating_count",
-    "count(userId)": "rater_count",
-    "count(DISTINCT userId)": "rater_count",
-    "count(movieId)": "movie_count",
-    "count(DISTINCT movieId)": "movie_count",
-    "avg(rating)": "avg_rating",
-    "round(avg(rating), 4)": "avg_rating",
-}
-
-
-@st.cache_data(show_spinner=False)
-def load_genres():
-    frame = pd.read_csv(GENRE_CSV)
-    frame = frame.rename(columns={name: COLUMN_ALIASES.get(name, name) for name in frame.columns})
-    missing = [name for name in ("genre", "rating_count") if name not in frame.columns]
-    if missing:
-        raise ValueError(
-            "Genre CSV is missing "
-            + ", ".join(missing)
-            + ". Columns found: "
-            + ", ".join(map(str, frame.columns))
-        )
-    frame = frame[frame["genre"].isin(GENRES)].copy()
-    frame["rating_count"] = frame["rating_count"].astype(int)
-    return frame.sort_values("rating_count", ascending=False)
+def _client():
+    last_error = None
+    for _ in range(15):
+        try:
+            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+            client.admin.command("ping")
+            return client
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+    raise RuntimeError("MongoDB did not answer at " + MONGO_URI) from last_error
 
 
 def _genre_names(raw):
@@ -67,29 +45,44 @@ def _flatrate(doc):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_coverage():
-    last_error = None
-    client = None
-    for _ in range(15):
-        try:
-            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
-            client.admin.command("ping")
-            break
-        except Exception as exc:
-            last_error = exc
-            client = None
-            time.sleep(2)
-    if client is None:
-        raise RuntimeError("MongoDB did not answer at " + MONGO_URI) from last_error
+def load_genres():
+    client = _client()
+    documents = list(
+        client[DATABASE][COLLECTION].find({}, {"_id": 0}).sort("rating_count", -1)
+    )
+    client.close()
+    if not documents:
+        raise RuntimeError(
+            "streamscope.genre_interest is empty. Start the container so the PySpark table is uploaded."
+        )
+    frame = pd.DataFrame(documents)
+    frame = frame[frame["genre"].isin(GENRES)].copy()
+    frame["rating_count"] = frame["rating_count"].astype(int)
+    for column in ("rater_count", "movie_count"):
+        if column in frame.columns:
+            frame[column] = frame[column].astype(int)
+    if "avg_rating" in frame.columns:
+        frame["avg_rating"] = frame["avg_rating"].astype(float)
+    total = int(frame["rating_count"].sum())
+    frame["activity_share"] = frame["rating_count"] / total if total else 0
+    if "movie_count" in frame.columns:
+        frame["ratings_per_movie"] = frame["rating_count"] / frame["movie_count"]
+    if "rater_count" in frame.columns:
+        frame["ratings_per_rater"] = frame["rating_count"] / frame["rater_count"]
+    return frame.sort_values("rating_count", ascending=False)
 
-    docs = client["streamscope"]["tmdb_providers"].find(
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_coverage():
+    client = _client()
+    documents = client[DATABASE]["tmdb_providers"].find(
         {"http_status": {"$in": [200, "200"]}},
         {"genres": 1, "payload.results.IN.flatrate": 1, "payload.results.in.flatrate": 1},
     )
     genre_rows = []
     provider_rows = []
     titles = 0
-    for doc in docs:
+    for doc in documents:
         titles += 1
         providers = _flatrate(doc)
         covered = 1 if providers else 0
@@ -128,16 +121,21 @@ def load_coverage():
 
 st.set_page_config(page_title="StreamScope", layout="wide")
 st.title("StreamScope")
-st.subheader("Genre demand from PySpark, coverage from MongoDB")
+st.subheader("MongoDB queries over the PySpark genre table")
 st.write(
-    "This container reads the PySpark genre table from "
-    + GENRE_CSV
-    + " and queries unstructured TMDB documents in MongoDB at "
-    + MONGO_URI
+    "The container uploads the HDFS genre table into "
+    + DATABASE
     + "."
+    + COLLECTION
+    + ", then this page queries "
+    + MONGO_URI
+    + ". The 32,000,204 ratings stay on HDFS."
 )
 
-if st.button("Query MongoDB", type="primary"):
+if st.button("Upload and query MongoDB", type="primary"):
+    with st.spinner("Uploading the genre table, then querying MongoDB"):
+        upload_genres()
+    load_genres.clear()
     load_coverage.clear()
     st.rerun()
 
@@ -145,42 +143,137 @@ try:
     genres = load_genres()
     coverage, providers, titles = load_coverage()
 except Exception as exc:
-    st.error("Could not read the PySpark CSV or MongoDB.")
+    st.error("MongoDB query failed.")
     st.code(str(exc))
     st.stop()
 
-one, two, three = st.columns(3)
-one.metric("Genres from the HDFS table", len(genres))
-two.metric("TMDB titles queried", titles)
-three.metric("Highest gap", coverage.iloc[0]["genre"] if not coverage.empty else "—")
+picked = st.sidebar.multiselect(
+    "Genres to compare",
+    genres["genre"].tolist(),
+    default=genres["genre"].tolist()[:8],
+)
+view = genres[genres["genre"].isin(picked)]
+if view.empty:
+    st.warning("Select at least one genre.")
+    st.stop()
 
-st.subheader("Demand computed by PySpark")
-st.plotly_chart(px.bar(genres, x="genre", y="rating_count"), width="stretch")
-st.caption(
-    "This file is the PySpark aggregate stored on HDFS. A title in two genres counts in both. "
-    "MovieLens ratings through 12 October 2023, not OTT views."
+one, two, three = st.columns(3)
+one.metric("Genres stored in MongoDB", len(genres))
+two.metric("Genres compared", len(view))
+three.metric("TMDB titles queried", titles)
+
+tab_activity, tab_quality, tab_demand, tab_mongo = st.tabs(
+    ["Activity", "Quality", "Demand per title", "MongoDB coverage"]
 )
 
-st.subheader("Subscription gap queried from MongoDB")
-if coverage.empty:
-    st.warning("No TMDB documents with HTTP 200 yet. Let fetch_tmdb.py finish, then click Query MongoDB.")
-else:
+with tab_activity:
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(
-            px.bar(coverage, x="genre", y="gap", labels={"gap": "Gap (1 − coverage)"}),
-            width="stretch",
-        )
+        st.subheader("Total ratings")
+        st.plotly_chart(px.bar(view, x="genre", y="rating_count"), width="stretch")
     with right:
-        st.plotly_chart(
-            px.bar(providers.head(12), x="provider", y="titles"),
-            width="stretch",
-        )
+        st.subheader("Share of all activity")
+        st.plotly_chart(px.pie(view, names="genre", values="rating_count", hole=0.45), width="stretch")
     st.caption(
-        "Gap = 1 − (titles with an India flatrate provider / titles stored). "
-        "Region IN, subscription providers only. A multi-genre title counts in each genre."
+        "Queried from streamscope.genre_interest. A title in two genres counts in both. "
+        "MovieLens ratings through 12 October 2023, not OTT views."
     )
-    shown = coverage.copy()
-    shown["coverage"] = (shown["coverage"] * 100).round(1)
-    shown["gap"] = (shown["gap"] * 100).round(1)
-    st.dataframe(shown, width="stretch", hide_index=True)
+
+with tab_quality:
+    if "avg_rating" not in view.columns:
+        st.warning("The uploaded documents have no avg_rating field.")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Average rating")
+            st.plotly_chart(
+                px.bar(
+                    view.sort_values("avg_rating", ascending=False),
+                    x="genre",
+                    y="avg_rating",
+                    range_y=[3.0, 4.0],
+                ),
+                width="stretch",
+            )
+        with right:
+            st.subheader("Activity against average rating")
+            st.plotly_chart(
+                px.scatter(
+                    view,
+                    x="rating_count",
+                    y="avg_rating",
+                    size="movie_count" if "movie_count" in view.columns else None,
+                    hover_name="genre",
+                    log_x=True,
+                ),
+                width="stretch",
+            )
+
+with tab_demand:
+    if "ratings_per_movie" not in view.columns:
+        st.info("Ratings per movie need movie_count in the uploaded table.")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Ratings per movie")
+            st.caption("A high bar means a few titles carry a lot of interest.")
+            st.plotly_chart(
+                px.bar(
+                    view.sort_values("ratings_per_movie", ascending=False),
+                    x="genre",
+                    y="ratings_per_movie",
+                ),
+                width="stretch",
+            )
+        with right:
+            st.subheader("Movies in the genre")
+            st.plotly_chart(
+                px.bar(view.sort_values("movie_count", ascending=False), x="genre", y="movie_count"),
+                width="stretch",
+            )
+        if "rater_count" in view.columns:
+            st.subheader("Distinct raters")
+            st.plotly_chart(
+                px.bar(view.sort_values("rater_count", ascending=False), x="genre", y="rater_count"),
+                width="stretch",
+            )
+
+with tab_mongo:
+    st.subheader("Subscription gap queried from tmdb_providers")
+    if coverage.empty:
+        st.warning(
+            "No TMDB documents with HTTP 200 are in this MongoDB yet. "
+            "The genre charts above are the uploaded PySpark table. "
+            "On the laptop, finish fetch_tmdb.py and click Upload and query MongoDB."
+        )
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(px.bar(coverage, x="genre", y="gap"), width="stretch")
+        with right:
+            st.plotly_chart(px.bar(providers.head(12), x="provider", y="titles"), width="stretch")
+        shown = coverage.copy()
+        shown["coverage"] = (shown["coverage"] * 100).round(1)
+        shown["gap"] = (shown["gap"] * 100).round(1)
+        st.dataframe(shown, width="stretch", hide_index=True)
+
+st.subheader("Rows returned by the genre query")
+table_columns = [
+    column
+    for column in (
+        "genre",
+        "rating_count",
+        "rater_count",
+        "movie_count",
+        "avg_rating",
+        "ratings_per_movie",
+        "activity_share",
+    )
+    if column in view.columns
+]
+shown = view[table_columns].copy()
+if "activity_share" in shown.columns:
+    shown["activity_share"] = (shown["activity_share"] * 100).round(2)
+if "ratings_per_movie" in shown.columns:
+    shown["ratings_per_movie"] = shown["ratings_per_movie"].round(0)
+st.dataframe(shown, width="stretch", hide_index=True)
