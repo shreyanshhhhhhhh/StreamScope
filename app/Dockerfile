@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY docker_dashboard.py upload_genres.py entrypoint.sh .
+COPY docker_dashboard.py upload_genres.py run_queries.py entrypoint.sh .
 RUN chmod +x entrypoint.sh
 EXPOSE 8502
 HEALTHCHECK --start-period=25s --interval=30s --timeout=5s --retries=3 \
